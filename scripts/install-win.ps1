@@ -61,10 +61,37 @@ WshShell.Run """$EscapedNode"" ""$EscapedDaemon""", 0, False
 "@
 Set-Content -Path $VbsPath -Value $VbsContent -Encoding ASCII
 
+$WshShell = New-Object -ComObject WScript.Shell
+
+# Ensure Antigravity shortcuts include --remote-debugging-port=0 (required on Antigravity v2.33.0+)
+$ShortcutSearchDirs = @(
+    [Environment]::GetFolderPath('Desktop'),
+    [Environment]::GetFolderPath('DesktopDirectory'),
+    [Environment]::GetFolderPath('Programs'),
+    [Environment]::GetFolderPath('Startup'),
+    (Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
+) | Select-Object -Unique | Where-Object { $_ -and (Test-Path $_) }
+
+foreach ($SearchDir in $ShortcutSearchDirs) {
+    Get-ChildItem -Path $SearchDir -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $Sc = $WshShell.CreateShortcut($_.FullName)
+            if ($Sc.TargetPath -and ($Sc.TargetPath -imatch '\\Antigravity\.exe$')) {
+                if ($Sc.Arguments -notmatch '--remote-debugging-port') {
+                    $Sc.Arguments = ("$($Sc.Arguments) --remote-debugging-port=0").Trim()
+                    $Sc.Save()
+                    Write-Host "[install-win] Patched CDP flag on shortcut: $($_.FullName)"
+                }
+            }
+        } catch {
+            # Ignore unreadable or protected shortcuts
+        }
+    }
+}
+
 if (-not $NoStartup) {
     $StartupDir = [Environment]::GetFolderPath('Startup')
     $ShortcutPath = Join-Path $StartupDir 'AntigravityCustomTheme.lnk'
-    $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = 'wscript.exe'
     $Shortcut.Arguments = """$VbsPath"""
@@ -75,8 +102,15 @@ if (-not $NoStartup) {
     Write-Host "[install-win] Startup shortcut created: $ShortcutPath"
 }
 
-Write-Host "[install-win] Launching daemon via wscript.exe..."
-Start-Process -FilePath 'wscript.exe' -ArgumentList """$VbsPath""" -WorkingDirectory $RepoRoot
+Write-Host "[install-win] Launching detached daemon via WMI Win32_Process..."
+$WmiCmd = "wscript.exe `"$VbsPath`""
+$WmiRes = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = $WmiCmd
+    CurrentDirectory = $RepoRoot
+}
+if ($WmiRes.ReturnValue -ne 0) {
+    Start-Process -FilePath 'wscript.exe' -ArgumentList """$VbsPath""" -WorkingDirectory $RepoRoot
+}
 
 for ($i = 0; $i -lt 15; $i++) {
     Start-Sleep -Milliseconds 250
@@ -86,6 +120,10 @@ for ($i = 0; $i -lt 15; $i++) {
         if ([int]::TryParse(($NewPidText -as [string]), [ref]$NewPid) -and $NewPid -gt 0) {
             if (Get-Process -Id $NewPid -ErrorAction SilentlyContinue) {
                 Write-Host "[install-win] Daemon running silently (PID $NewPid)."
+                $PortFile = Join-Path $env:APPDATA 'Antigravity\DevToolsActivePort'
+                if (-not (Test-Path $PortFile)) {
+                    Write-Host "[install-win] Note: DevToolsActivePort not found yet. Quit Antigravity completely and reopen it from Desktop or Start Menu."
+                }
                 exit 0
             }
         }
