@@ -4416,7 +4416,8 @@
     const activeShell = findActiveShell();
     if (activeShell) {
       const liveLayer = document.getElementById('agy-live-bg-layer');
-      if (!liveLayer || liveLayer.tagName !== 'AGY-LIVE-BG' || liveLayer.parentElement !== activeShell) {
+      if (!liveLayer || liveLayer.tagName !== 'AGY-LIVE-BG' || liveLayer.parentElement !== activeShell || window.__AGY_LAST_APPLIED_BASE__ !== window.__AGY_MEDIA_BASE_URL__) {
+        window.__AGY_LAST_APPLIED_BASE__ = window.__AGY_MEDIA_BASE_URL__;
         applyTheme();
       }
     }

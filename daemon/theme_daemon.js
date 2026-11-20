@@ -7,6 +7,7 @@
  * persists user theme preferences in theme_config.json, and hot-reloads on rebuild.
  */
 
+const { execFile } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
@@ -653,9 +654,78 @@ function createSession(target) {
     ws.addEventListener('error', cleanup);
 }
 
+let healingInProgress = false;
+let lastHealCheckAt = 0;
+let lastRelaunchAt = 0;
+
+function selfHealWindowsCdpIfNeeded() {
+    if (process.platform !== 'win32' || healingInProgress) return;
+    const now = Date.now();
+    if (now - lastHealCheckAt < 6000 || now - lastRelaunchAt < 30000) return;
+    lastHealCheckAt = now;
+    healingInProgress = true;
+
+    const psScript = `
+$ErrorActionPreference = 'SilentlyContinue'
+$MainProcs = Get-CimInstance Win32_Process -Filter "Name = 'Antigravity.exe'" | Where-Object {
+    $_.CommandLine -and ($_.CommandLine -notmatch '--type=|--import=|sidecars') -and ($_.CommandLine -notmatch '--remote-debugging-port')
+}
+if (-not $MainProcs) { exit 0 }
+$ExePath = ($MainProcs | Select-Object -First 1).ExecutablePath
+if (-not $ExePath -or -not (Test-Path $ExePath)) { exit 0 }
+
+$Wsh = New-Object -ComObject WScript.Shell
+$Dirs = @(
+    [Environment]::GetFolderPath('Desktop'),
+    [Environment]::GetFolderPath('DesktopDirectory'),
+    [Environment]::GetFolderPath('Programs'),
+    [Environment]::GetFolderPath('Startup'),
+    (Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar')
+) | Select-Object -Unique | Where-Object { $_ -and (Test-Path $_) }
+foreach ($D in $Dirs) {
+    Get-ChildItem -Path $D -Recurse -Filter '*.lnk' | ForEach-Object {
+        try {
+            $Sc = $Wsh.CreateShortcut($_.FullName)
+            if ($Sc.TargetPath -and ($Sc.TargetPath -imatch '\\\\Antigravity\\.exe$') -and ($Sc.Arguments -notmatch '--remote-debugging-port')) {
+                $Sc.Arguments = ("$($Sc.Arguments) --remote-debugging-port=0").Trim()
+                $Sc.Save()
+            }
+        } catch {}
+    }
+}
+
+Stop-Process -Name 'Antigravity' -Force
+Start-Sleep -Milliseconds 600
+$PortFile = Join-Path $env:APPDATA 'antigravity\\DevToolsActivePort'
+if (Test-Path $PortFile) { Remove-Item $PortFile -Force }
+$WorkDir = Split-Path -Parent $ExePath
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = "\`"$ExePath\`" --remote-debugging-port=0"
+    CurrentDirectory = $WorkDir
+} | Out-Null
+Write-Output "HEALED_AND_RELAUNCHED"
+`;
+
+    execFile(
+        'powershell.exe',
+        ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
+        { timeout: 15000, windowsHide: true },
+        (_err, stdout) => {
+            healingInProgress = false;
+            if (stdout && String(stdout).includes('HEALED_AND_RELAUNCHED')) {
+                lastRelaunchAt = Date.now();
+                log('Self-healed Antigravity shortcuts and relaunched with --remote-debugging-port=0 after update.');
+            }
+        }
+    );
+}
+
 async function scanPages() {
     const info = getPortInfo();
-    if (!info) return;
+    if (!info) {
+        selfHealWindowsCdpIfNeeded();
+        return;
+    }
 
     if (lastPort !== null && lastPort !== info.port) {
         for (const s of sessions.values()) {
@@ -671,6 +741,7 @@ async function scanPages() {
     try {
         targets = await fetchJson(`http://127.0.0.1:${info.port}/json`);
     } catch (_) {
+        selfHealWindowsCdpIfNeeded();
         return;
     }
     if (!Array.isArray(targets)) return;
